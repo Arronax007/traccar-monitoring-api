@@ -6,11 +6,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.net.ServerSocket;
-import java.net.Socket;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
@@ -39,9 +36,6 @@ public class TraccarService {
     @Value("${simulation.radius:2000}")
     private double radius;
 
-    @Value("${traccar.protocol.port:5055}")
-    private int traccarPort;
-
     public TraccarService(SimpMessagingTemplate messagingTemplate) {
         this.messagingTemplate = messagingTemplate;
     }
@@ -52,16 +46,14 @@ public class TraccarService {
             return;
         }
 
-        Thread deviceThread;
         if ("simulation".equals(trackingMode)) {
-            deviceThread = createSimulationThread(deviceId);
+            Thread simulationThread = createSimulationThread(deviceId);
+            deviceThreads.put(deviceId, simulationThread);
+            simulationThread.start();
+            log.info("Started monitoring device {} in simulation mode", deviceId);
         } else {
-            deviceThread = createRealConnectionThread(deviceId);
+            log.info("Device {} ready for real GPS data", deviceId);
         }
-
-        deviceThreads.put(deviceId, deviceThread);
-        deviceThread.start();
-        log.info("Started monitoring device {} in {} mode", deviceId, trackingMode);
     }
 
     private Thread createSimulationThread(String deviceId) {
@@ -82,8 +74,7 @@ public class TraccarService {
                             .status("active")
                             .build();
 
-                    lastKnownPositions.put(deviceId, gpsData);
-                    messagingTemplate.convertAndSend("/topic/gps/" + deviceId, gpsData);
+                    processGpsData(gpsData);
                     Thread.sleep(updateInterval);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -93,49 +84,11 @@ public class TraccarService {
         });
     }
 
-    private Thread createRealConnectionThread(String deviceId) {
-        return new Thread(() -> {
-            try (ServerSocket serverSocket = new ServerSocket(traccarPort)) {
-                log.info("Listening for GPS data on port {}", traccarPort);
-                while (!Thread.currentThread().isInterrupted()) {
-                    try (Socket clientSocket = serverSocket.accept();
-                         BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()))) {
-                        
-                        String line;
-                        while ((line = in.readLine()) != null) {
-                            try {
-                                // Format attendu: deviceId,latitude,longitude,speed,timestamp
-                                String[] data = line.split(",");
-                                if (data.length >= 5 && data[0].equals(deviceId)) {
-                                    GpsData gpsData = GpsData.builder()
-                                            .deviceId(deviceId)
-                                            .latitude(Double.parseDouble(data[1]))
-                                            .longitude(Double.parseDouble(data[2]))
-                                            .speed(Double.parseDouble(data[3]))
-                                            .timestamp(Long.parseLong(data[4]))
-                                            .status("active")
-                                            .build();
-
-                                    lastKnownPositions.put(deviceId, gpsData);
-                                    messagingTemplate.convertAndSend("/topic/gps/" + deviceId, gpsData);
-                                    log.debug("Received GPS data for device {}: {}", deviceId, gpsData);
-                                }
-                            } catch (Exception e) {
-                                log.error("Error parsing GPS data: {}", e.getMessage());
-                            }
-                        }
-                    } catch (IOException e) {
-                        log.error("Error in client connection: {}", e.getMessage());
-                        // Petite pause avant de réessayer
-                        Thread.sleep(1000);
-                    }
-                }
-            } catch (IOException e) {
-                log.error("Error creating server socket: {}", e.getMessage());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        });
+    public void processGpsData(GpsData gpsData) {
+        String deviceId = gpsData.getDeviceId();
+        lastKnownPositions.put(deviceId, gpsData);
+        messagingTemplate.convertAndSend("/topic/gps/" + deviceId, gpsData);
+        log.debug("Processed GPS data for device {}: {}", deviceId, gpsData);
     }
 
     public void stopDeviceMonitoring(String deviceId) {
@@ -146,8 +99,8 @@ public class TraccarService {
         }
     }
 
-    public Map<String, GpsData> getDevicePositions() {
-        return lastKnownPositions;
+    public List<GpsData> getDevicePositions() {
+        return new ArrayList<>(lastKnownPositions.values());
     }
 
     public String getDeviceStatus(String deviceId) {
