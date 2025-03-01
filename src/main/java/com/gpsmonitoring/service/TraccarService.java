@@ -1,109 +1,115 @@
 package com.gpsmonitoring.service;
 
+import com.gpsmonitoring.model.DeviceStatus;
 import com.gpsmonitoring.model.GpsData;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
-@Slf4j
+import static java.util.stream.Collectors.toList;
+
 @Service
+@Slf4j
 public class TraccarService {
-
-    private final Map<String, Thread> deviceThreads = new ConcurrentHashMap<>();
-    private final Map<String, GpsData> lastKnownPositions = new ConcurrentHashMap<>();
     private final SimpMessagingTemplate messagingTemplate;
-    private final Random random = new Random();
-
-    @Value("${gps.tracking.mode:simulation}")
-    private String trackingMode;
-
-    @Value("${simulation.update.interval:5000}")
-    private long updateInterval;
-
-    @Value("${simulation.center.latitude:46.5197}")
-    private double centerLatitude;
-
-    @Value("${simulation.center.longitude:6.6323}")
-    private double centerLongitude;
-
-    @Value("${simulation.radius:2000}")
-    private double radius;
+    private Map<String, DeviceStatus> deviceStatusMap = new ConcurrentHashMap<>();
+    private Map<String, Instant> lastUpdateMap = new ConcurrentHashMap<>();
+    private static final Duration OFFLINE_THRESHOLD = Duration.ofMinutes(5);
 
     public TraccarService(SimpMessagingTemplate messagingTemplate) {
         this.messagingTemplate = messagingTemplate;
     }
 
-    public void startDeviceMonitoring(String deviceId, String traccarServerUrl) {
-        if (deviceThreads.containsKey(deviceId)) {
-            log.info("Device {} is already being monitored", deviceId);
-            return;
-        }
-
-        if ("simulation".equals(trackingMode)) {
-            Thread simulationThread = createSimulationThread(deviceId);
-            deviceThreads.put(deviceId, simulationThread);
-            simulationThread.start();
-            log.info("Started monitoring device {} in simulation mode", deviceId);
+    public void updateDeviceStatus(String deviceId, Map<String, String> params) {
+        DeviceStatus status = deviceStatusMap.computeIfAbsent(deviceId, k -> new DeviceStatus());
+        
+        // Mise à jour du statut
+        status.setDeviceId(deviceId);
+        status.setLatitude(params.getOrDefault("latitude", params.get("lat")));
+        status.setLongitude(params.getOrDefault("longitude", params.get("lon")));
+        status.setSpeed(params.getOrDefault("speed", "0"));
+        status.setBearing(params.getOrDefault("bearing", "0"));
+        status.setPower(params.getOrDefault("power", "1"));
+        status.setBattery(params.getOrDefault("battery", params.get("batt")));
+        status.setActive(true);
+        status.setLastUpdate(System.currentTimeMillis());
+        
+        // Si power=0, marquer comme hors ligne
+        if ("0".equals(params.get("power"))) {
+            log.info("Device marked as offline: {}", deviceId);
+            deviceStatusMap.remove(deviceId);
+            lastUpdateMap.remove(deviceId);
         } else {
-            log.info("Device {} ready for real GPS data", deviceId);
+            lastUpdateMap.put(deviceId, Instant.now());
+            // Notifier les clients WebSocket du changement
+            messagingTemplate.convertAndSend("/topic/devices", getDevicesStatus());
         }
     }
 
-    private Thread createSimulationThread(String deviceId) {
-        return new Thread(() -> {
-            while (!Thread.currentThread().isInterrupted()) {
-                try {
-                    // Simuler un mouvement aléatoire autour du centre
-                    double lat = centerLatitude + (random.nextDouble() - 0.5) * radius / 111000.0;
-                    double lon = centerLongitude + (random.nextDouble() - 0.5) * radius / (111000.0 * Math.cos(Math.toRadians(centerLatitude)));
-                    double speed = random.nextDouble() * 60.0; // Vitesse entre 0 et 60 km/h
+    // Méthode pour le simulateur Python
+    public void processGpsData(GpsData gpsData) {
+        Map<String, String> params = Map.of(
+            "latitude", String.valueOf(gpsData.getLatitude()),
+            "longitude", String.valueOf(gpsData.getLongitude()),
+            "speed", String.valueOf(gpsData.getSpeed()),
+            "bearing", String.valueOf(gpsData.getBearing()),
+            "battery", String.valueOf(gpsData.getBattery()),
+            "power", "1",
+            "timestamp", String.valueOf(gpsData.getTimestamp())
+        );
+        
+        updateDeviceStatus(gpsData.getDeviceId(), params);
+        // Notification spécifique pour le simulateur
+        messagingTemplate.convertAndSend("/topic/gps/" + gpsData.getDeviceId(), gpsData);
+    }
 
-                    GpsData gpsData = GpsData.builder()
-                            .deviceId(deviceId)
-                            .latitude(lat)
-                            .longitude(lon)
-                            .speed(speed)
-                            .timestamp(System.currentTimeMillis())
-                            .status("active")
-                            .build();
-
-                    processGpsData(gpsData);
-                    Thread.sleep(updateInterval);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
+    @Scheduled(fixedRate = 60000) // Vérifie toutes les minutes
+    public void cleanupOfflineDevices() {
+        Instant now = Instant.now();
+        deviceStatusMap.entrySet().removeIf(entry -> {
+            String deviceId = entry.getKey();
+            DeviceStatus status = entry.getValue();
+            Instant lastUpdate = lastUpdateMap.get(deviceId);
+            
+            // Supprime si le device est marqué comme hors ligne (power=0) ou n'a pas été mis à jour depuis longtemps
+            boolean shouldRemove = "0".equals(status.getPower()) ||
+                                 (lastUpdate != null && now.isAfter(lastUpdate.plus(OFFLINE_THRESHOLD)));
+            
+            if (shouldRemove) {
+                lastUpdateMap.remove(deviceId);
+                log.info("Device removed: {}", deviceId);
+                // Notifier les clients WebSocket de la suppression
+                messagingTemplate.convertAndSend("/topic/devices", getDevicesStatus());
             }
+            
+            return shouldRemove;
         });
     }
 
-    public void processGpsData(GpsData gpsData) {
-        String deviceId = gpsData.getDeviceId();
-        lastKnownPositions.put(deviceId, gpsData);
-        messagingTemplate.convertAndSend("/topic/gps/" + deviceId, gpsData);
-        log.debug("Processed GPS data for device {}: {}", deviceId, gpsData);
+    public Map<String, DeviceStatus> getDevicesStatus() {
+        return deviceStatusMap;
     }
 
-    public void stopDeviceMonitoring(String deviceId) {
-        Thread thread = deviceThreads.remove(deviceId);
-        if (thread != null) {
-            thread.interrupt();
-            log.info("Stopped monitoring device {}", deviceId);
-        }
-    }
-
-    public List<GpsData> getDevicePositions() {
-        return new ArrayList<>(lastKnownPositions.values());
-    }
-
-    public String getDeviceStatus(String deviceId) {
-        return deviceThreads.containsKey(deviceId) ? "active" : "inactive";
+    public List<GpsData> getCurrentPositions() {
+        return deviceStatusMap.values().stream()
+            .map(status -> GpsData.builder()
+                .deviceId(status.getDeviceId())
+                .latitude(Double.parseDouble(status.getLatitude()))
+                .longitude(Double.parseDouble(status.getLongitude()))
+                .speed(status.getSpeed() != null ? Double.parseDouble(status.getSpeed()) : 0.0)
+                .bearing(status.getBearing() != null ? Double.parseDouble(status.getBearing()) : 0.0)
+                .battery(status.getBattery() != null ? Double.parseDouble(status.getBattery()) : 100.0)
+                .timestamp(status.getLastUpdate())
+                .status(status.isActive() ? "active" : "inactive")
+                .build())
+            .collect(Collectors.toList());
     }
 }

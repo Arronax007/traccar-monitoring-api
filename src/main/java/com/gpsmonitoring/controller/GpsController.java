@@ -1,83 +1,112 @@
 package com.gpsmonitoring.controller;
 
-import com.gpsmonitoring.dto.DeviceRequestDto;
+import com.gpsmonitoring.model.DeviceStatus;
 import com.gpsmonitoring.model.GpsData;
 import com.gpsmonitoring.service.TraccarService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import javax.servlet.http.HttpServletRequest;
-import java.util.Enumeration;
 import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-@Slf4j
 @RestController
 @RequestMapping("/api/devices")
-@CrossOrigin(origins = "*", allowCredentials = "false")
+@Slf4j
+@CrossOrigin(origins = "http://localhost:3000", allowCredentials = "false")
 public class GpsController {
 
     private final TraccarService traccarService;
+    
+    // Pattern pour parser les trames NMEA GPRMC
+    private static final Pattern GPRMC_PATTERN = Pattern.compile(
+        "\\$GPRMC,(\\d{2})(\\d{2})(\\d{2})\\.?\\d*,([AV]),?" +
+        "(\\d{2})(\\d{2}\\.\\d+),([NS]),?(\\d{3})(\\d{2}\\.\\d+),([EW]),?" +
+        "(\\d*\\.?\\d*),(\\d*\\.?\\d*),?(\\d{6})?,?.*");
 
     public GpsController(TraccarService traccarService) {
         this.traccarService = traccarService;
     }
 
-    @PostMapping("/{deviceId}/start")
-    public ResponseEntity<Void> startMonitoring(@PathVariable String deviceId, @RequestBody(required = false) DeviceRequestDto request) {
-        String serverUrl = request != null ? request.getServerUrl() : null;
-        traccarService.startDeviceMonitoring(deviceId, serverUrl);
-        return ResponseEntity.ok().build();
+    // Endpoint pour le simulateur Python
+    @PostMapping("/simulator")
+    public ResponseEntity<String> receiveSimulatorData(@RequestBody GpsData gpsData) {
+        try {
+            log.info("Received simulator data: {}", gpsData);
+            traccarService.processGpsData(gpsData);
+            return ResponseEntity.ok("OK");
+        } catch (Exception e) {
+            log.error("Error processing simulator data: {}", e.getMessage(), e);
+            return ResponseEntity.badRequest().body("Error: " + e.getMessage());
+        }
     }
 
-    @PostMapping("/{deviceId}/stop")
-    public ResponseEntity<Void> stopMonitoring(@PathVariable String deviceId) {
-        traccarService.stopDeviceMonitoring(deviceId);
-        return ResponseEntity.ok().build();
+    @GetMapping("/osmand")
+    public ResponseEntity<String> handleOsmAndData(
+            @RequestParam String id,
+            @RequestParam Map<String, String> params) {
+        
+        traccarService.updateDeviceStatus(id, params);
+        return ResponseEntity.ok("OK");
+    }
+    
+    @PostMapping("/nmea")
+    public ResponseEntity<String> handleNmeaData(
+            @RequestParam String deviceId,
+            @RequestBody String nmeaString) {
+        
+        try {
+            // Parse NMEA GPRMC sentence
+            Matcher matcher = GPRMC_PATTERN.matcher(nmeaString);
+            if (matcher.matches()) {
+                // Extraction des données
+                String time = matcher.group(1) + matcher.group(2) + matcher.group(3);
+                String status = matcher.group(4);
+                double latitude = Double.parseDouble(matcher.group(5)) + 
+                                Double.parseDouble(matcher.group(6)) / 60.0;
+                if (matcher.group(7).equals("S")) latitude = -latitude;
+                
+                double longitude = Double.parseDouble(matcher.group(8)) + 
+                                 Double.parseDouble(matcher.group(9)) / 60.0;
+                if (matcher.group(10).equals("W")) longitude = -longitude;
+                
+                String speed = matcher.group(11);
+                String bearing = matcher.group(12);
+                
+                // Conversion en format compatible
+                Map<String, String> params = Map.of(
+                    "lat", String.valueOf(latitude),
+                    "lon", String.valueOf(longitude),
+                    "speed", speed,
+                    "bearing", bearing,
+                    "timestamp", time,
+                    "power", status.equals("A") ? "1" : "0"  // A = actif, V = warning
+                );
+                
+                traccarService.updateDeviceStatus(deviceId, params);
+                return ResponseEntity.ok("Position updated");
+            }
+            return ResponseEntity.badRequest().body("Invalid NMEA format");
+        } catch (Exception e) {
+            log.error("Error processing NMEA data for device {}: {}", deviceId, e.getMessage());
+            return ResponseEntity.badRequest().body("Error processing NMEA data");
+        }
+    }
+
+    @GetMapping("/status")
+    public ResponseEntity<Map<String, DeviceStatus>> getDevicesStatus() {
+        return ResponseEntity.ok(traccarService.getDevicesStatus());
     }
 
     @GetMapping("/positions")
-    public ResponseEntity<List<GpsData>> getDevicePositions() {
-        return ResponseEntity.ok(traccarService.getDevicePositions());
-    }
-
-    @RequestMapping(value = "/osmand", method = {RequestMethod.GET, RequestMethod.POST})
-    public ResponseEntity<String> receiveGpsData(
-            @RequestParam("id") String deviceId,
-            @RequestParam("lat") double latitude,
-            @RequestParam("lon") double longitude,
-            @RequestParam(value = "timestamp", required = false) Long timestamp,
-            @RequestParam(value = "speed", required = false, defaultValue = "0.0") double speed,
-            @RequestParam(value = "bearing", required = false, defaultValue = "0.0") double bearing,
-            @RequestParam(value = "altitude", required = false) Double altitude,
-            @RequestParam(value = "accuracy", required = false) Double accuracy,
-            @RequestParam(value = "batt", required = false) Double battery,
-            HttpServletRequest request) {
-        
-        log.info("GPS data from {}: lat={}, lon={}, speed={}, battery={}%", 
-                deviceId, latitude, longitude, speed, battery);
-
-        GpsData gpsData = GpsData.builder()
-                .deviceId(deviceId)
-                .latitude(latitude)
-                .longitude(longitude)
-                .speed(speed)
-                .timestamp(timestamp != null ? timestamp * 1000 : System.currentTimeMillis())
-                .status("active")
-                .build();
-
-        traccarService.processGpsData(gpsData);
-        return ResponseEntity.ok("OK\r\n");
+    public ResponseEntity<List<GpsData>> getCurrentPositions() {
+        return ResponseEntity.ok(traccarService.getCurrentPositions());
     }
 
     @GetMapping("/test")
-    public ResponseEntity<String> test(HttpServletRequest request) {
-        log.info("Test endpoint called from: {} {}", request.getRemoteAddr(), request.getRemoteHost());
-        return ResponseEntity.ok("Server is running!");
-    }
-
-    @GetMapping("/ping")
-    public String ping() {
-        return "pong";
+    public ResponseEntity<String> test() {
+        return ResponseEntity.ok("OK");
     }
 }
